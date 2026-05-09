@@ -208,6 +208,18 @@ Build the image:
 docker build -t ses-bounce-webhook:local .
 ```
 
+Published images live at:
+
+```text
+ghcr.io/lanefu/ses-bounce-webhook
+```
+
+GitHub Actions publishing behavior:
+
+- pull requests build the image for validation only
+- pushes to `main` publish rolling `edge` and `sha-<commit>` tags
+- pushes of semver tags like `v0.1.0` publish version tags plus `latest`
+
 Run it with a mounted config and data directory:
 
 ```bash
@@ -218,6 +230,16 @@ docker run --rm -p 8000:8000 \
   -v /tmp/ses-bounce-config:/data/config:ro \
   -v /tmp/ses-bounce-data:/data/db \
   ses-bounce-webhook:local
+```
+
+Pull and run the published image:
+
+```bash
+docker pull ghcr.io/lanefu/ses-bounce-webhook:edge
+docker run --rm -p 8000:8000 \
+  -v /tmp/ses-bounce-config:/data/config:ro \
+  -v /tmp/ses-bounce-data:/data/db \
+  ghcr.io/lanefu/ses-bounce-webhook:edge
 ```
 
 For container/Kubernetes use, set the TOML file to:
@@ -245,6 +267,12 @@ access_log = true
 
 Static manifests live in `deploy/k8s/`. Edit the image name, host, AWS region, and `web.root_path` in the manifests before applying them or pointing Flux at the directory.
 
+The default manifests now reference:
+
+```text
+ghcr.io/lanefu/ses-bounce-webhook:latest
+```
+
 ```bash
 kubectl apply -f deploy/k8s/
 ```
@@ -259,6 +287,25 @@ The default deployment uses:
 - PVC mounted at `/data/db`
 - liveness probe `/healthz`
 - readiness and startup probes `/readyz`
+
+## Release Flow
+
+For the GitHub Actions-based container publishing flow:
+
+```bash
+git push origin main
+```
+
+That publishes refreshed `edge` and `sha-*` images from the current `main` commit.
+
+For a versioned release image:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+That publishes semver tags for the image, including `0.1.0`, `0.1`, `0`, and `latest`.
 
 The public SNS endpoint for the included ingress example is:
 

@@ -28,7 +28,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: webhook
-          image: ghcr.io/your-org/ses-bounce-webhook:latest
+          image: ghcr.io/lanefu/ses-bounce-webhook:latest
           imagePullPolicy: IfNotPresent
           ports:
             - name: http
