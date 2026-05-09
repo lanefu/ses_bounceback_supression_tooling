@@ -1,0 +1,37 @@
+[database]
+path = "bouncebacks.sqlite3"
+
+[imap]
+host = "imap.gmail.com"
+label = "armbian_email_delivery"
+# Prefer SES_BOUNCE_IMAP_USER and SES_BOUNCE_IMAP_PASS for secrets.
+# user = "mailbox@example.org"
+# password = "app-password"
+
+[aws]
+# Prefer AWS_REGION/AWS_PROFILE or the normal AWS credential chain.
+# region = "us-east-1"
+# profile = "default"
+retry_count = 6
+delay_seconds = 0.25
+batch_size = 10
+
+[web]
+host = "127.0.0.1"
+port = 8000
+root_path = ""
+proxy_headers = false
+forwarded_allow_ips = "127.0.0.1"
+verify_sns = true
+unsafe_skip_sns_verify = false
+
+[logging]
+level = "INFO"
+format = "text"
+access_log = true
+uvicorn_log_level = "info"
+
+[otel]
+service_name = "ses-bounce-webhook"
+# exporter_otlp_endpoint = "http://otel-collector:4317"
+# resource_attributes = "deployment.environment=dev"

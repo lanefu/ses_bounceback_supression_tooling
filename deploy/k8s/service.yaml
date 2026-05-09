@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: ses-bounce-webhook
+  namespace: ses-bounce
+  labels:
+    app.kubernetes.io/name: ses-bounce-webhook
+spec:
+  selector:
+    app.kubernetes.io/name: ses-bounce-webhook
+  ports:
+    - name: http
+      port: 80
+      targetPort: http

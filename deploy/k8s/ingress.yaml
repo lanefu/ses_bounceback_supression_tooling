@@ -1,0 +1,23 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ses-bounce-webhook
+  namespace: ses-bounce
+  labels:
+    app.kubernetes.io/name: ses-bounce-webhook
+  annotations:
+    # nginx example: preserve /ses-bounce as the external prefix and let FastAPI root_path handle it.
+    nginx.ingress.kubernetes.io/use-forwarded-headers: "true"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: example.org
+      http:
+        paths:
+          - path: /ses-bounce
+            pathType: Prefix
+            backend:
+              service:
+                name: ses-bounce-webhook
+                port:
+                  name: http

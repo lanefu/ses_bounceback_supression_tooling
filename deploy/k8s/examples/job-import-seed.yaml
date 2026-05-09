@@ -1,0 +1,63 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ses-bounce-import-seed
+  namespace: ses-bounce
+  labels:
+    app.kubernetes.io/name: ses-bounce-webhook
+spec:
+  backoffLimit: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ses-bounce-webhook
+        app.kubernetes.io/component: seed-import
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: import-seed
+          image: ghcr.io/your-org/ses-bounce-webhook:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - python
+            - seed_store.py
+            - --config
+            - /data/config/ses-bounce.toml
+            - import-seed
+            - --input
+            - /seed/ses-bounce-seed.zip
+          volumeMounts:
+            - name: config
+              mountPath: /data/config
+              readOnly: true
+            - name: db
+              mountPath: /data/db
+            - name: seed
+              mountPath: /seed
+              readOnly: true
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+      volumes:
+        - name: config
+          configMap:
+            name: ses-bounce-config
+        - name: db
+          persistentVolumeClaim:
+            claimName: ses-bounce-data
+        - name: seed
+          secret:
+            # Create this separately, for example:
+            # kubectl -n ses-bounce create secret generic ses-bounce-seed --from-file=ses-bounce-seed.zip=/tmp/ses-bounce-seed.zip
+            # Large seeds may exceed Secret size limits; use an object-store/download init pattern instead.
+            secretName: ses-bounce-seed

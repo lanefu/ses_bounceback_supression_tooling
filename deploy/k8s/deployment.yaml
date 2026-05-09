@@ -1,0 +1,85 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ses-bounce-webhook
+  namespace: ses-bounce
+  labels:
+    app.kubernetes.io/name: ses-bounce-webhook
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ses-bounce-webhook
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ses-bounce-webhook
+        app.kubernetes.io/component: webhook
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: webhook
+          image: ghcr.io/your-org/ses-bounce-webhook:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+          env:
+            - name: SES_BOUNCE_CONFIG
+              value: /data/config/ses-bounce.toml
+          # Prefer workload identity/IRSA. Uncomment only if static fallback credentials are necessary.
+          # envFrom:
+          #   - secretRef:
+          #       name: ses-bounce-secret
+          volumeMounts:
+            - name: config
+              mountPath: /data/config
+              readOnly: true
+            - name: db
+              mountPath: /data/db
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 15
+          startupProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            failureThreshold: 20
+            periodSeconds: 3
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+      volumes:
+        - name: config
+          configMap:
+            name: ses-bounce-config
+        - name: db
+          persistentVolumeClaim:
+            claimName: ses-bounce-data

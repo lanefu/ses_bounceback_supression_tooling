@@ -1,0 +1,42 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ses-bounce-config
+  namespace: ses-bounce
+  labels:
+    app.kubernetes.io/name: ses-bounce-webhook
+data:
+  ses-bounce.toml: |
+    [database]
+    path = "/data/db/bouncebacks.sqlite3"
+
+    [imap]
+    host = "imap.gmail.com"
+    label = "armbian_email_delivery"
+
+    [aws]
+    # Prefer workload identity/IRSA in Kubernetes instead of static AWS keys.
+    region = "us-east-1"
+    retry_count = 6
+    delay_seconds = 0.25
+    batch_size = 10
+
+    [web]
+    host = "0.0.0.0"
+    port = 8000
+    root_path = "/ses-bounce"
+    proxy_headers = true
+    forwarded_allow_ips = "*"
+    verify_sns = true
+    unsafe_skip_sns_verify = false
+
+    [logging]
+    level = "INFO"
+    format = "json"
+    access_log = true
+    uvicorn_log_level = "info"
+
+    [otel]
+    service_name = "ses-bounce-webhook"
+    # exporter_otlp_endpoint = "http://otel-collector.observability.svc.cluster.local:4317"
+    resource_attributes = "deployment.environment=kubernetes"
