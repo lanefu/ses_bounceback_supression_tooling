@@ -8,6 +8,7 @@ import imaplib
 import json
 import logging
 import os
+import sys
 from collections import Counter
 from dataclasses import dataclass
 from email import message_from_bytes
@@ -16,14 +17,11 @@ from typing import Any, Optional
 
 from bounceback_store import (
     connect_db,
-    count_bounce_events,
-    count_bounce_recipients,
-    count_distinct_bounce_emails,
-    count_transient_bounce_emails,
+    build_triage_report,
     insert_bounce_event as store_insert_bounce_event,
     load_scan_state,
     query_suppression_rows,
-    query_transient_review_rows,
+    normalize_triage_bucket_filter,
     save_scan_state,
     seen_event as store_seen_event,
 )
@@ -89,12 +87,23 @@ def parse_args() -> argparse.Namespace:
     sync_parser = subparsers.add_parser("sync", help="Scan the mailbox and ingest new bouncebacks.")
     sync_parser.set_defaults(command="sync")
 
-    report_parser = subparsers.add_parser("report", help="Print bounceback summaries from SQLite.")
+    report_parser = subparsers.add_parser("report", help="Print a decision-oriented bounceback triage report from SQLite.")
     report_parser.add_argument(
         "--limit",
         type=int,
         default=50,
-        help="How many suppression rows to print in the report.",
+        help="How many rows to show per report section.",
+    )
+    report_parser.add_argument(
+        "--format",
+        choices=("text", "json", "csv"),
+        default="text",
+        help="Report output format.",
+    )
+    report_parser.add_argument(
+        "--bucket",
+        default=None,
+        help="Optional decision bucket filter: remove-now, watch, or ignore-for-now.",
     )
     report_parser.set_defaults(command="report")
 
@@ -403,83 +412,119 @@ def sync(config: AppConfig) -> None:
         conn.close()
 
 
-def print_report(conn, db_path: str, limit: int) -> None:
-    total_events = count_bounce_events(conn)
-    total_recipients = count_bounce_recipients(conn)
-    distinct_emails = count_distinct_bounce_emails(conn)
-    transient_emails = count_transient_bounce_emails(conn)
+def report_csv_rows(report: dict[str, Any]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for section in report.get("sections", []):
+        for row in section.get("rows", []):
+            rows.append(
+                {
+                    "section": section.get("title", ""),
+                    "decision_bucket": row.get("decision_bucket", ""),
+                    "decision_reason": row.get("decision_reason", ""),
+                    "email_address": row.get("email_address", ""),
+                    "total_count": row.get("total_count", 0),
+                    "permanent_count": row.get("permanent_count", 0),
+                    "transient_count": row.get("transient_count", 0),
+                    "last_seen": row.get("last_seen", ""),
+                    "bounce_type": row.get("bounce_type", ""),
+                    "bounce_subtype": row.get("bounce_subtype", ""),
+                    "diagnostic_code": row.get("diagnostic_code", ""),
+                    "last_subject": row.get("last_subject", ""),
+                    "last_message_id": row.get("last_message_id", ""),
+                    "last_ses_message_id": row.get("last_ses_message_id", ""),
+                }
+            )
+    return rows
+
+
+def emit_report(conn, db_path: str, limit: int, fmt: str, bucket: Optional[str] = None) -> None:
+    report = build_triage_report(conn, limit=limit, bucket=normalize_triage_bucket_filter(bucket))
     last_sync = conn.execute(
         "SELECT label, last_uid, updated_at FROM scan_state ORDER BY updated_at DESC LIMIT 1"
     ).fetchone()
 
-    print("SES Bounceback Report")
-    print("=====================")
+    if fmt == "json":
+        json.dump(
+            {
+                "db_path": db_path,
+                "last_scan": (
+                    {"label": last_sync[0], "last_uid": int(last_sync[1]), "updated_at": last_sync[2]}
+                    if last_sync is not None
+                    else None
+                ),
+                **report,
+            },
+            sys.stdout,
+            indent=2,
+            ensure_ascii=False,
+        )
+        sys.stdout.write("\n")
+        return
+
+    if fmt == "csv":
+        writer = csv.DictWriter(
+            sys.stdout,
+            fieldnames=[
+                "section",
+                "decision_bucket",
+                "decision_reason",
+                "email_address",
+                "total_count",
+                "permanent_count",
+                "transient_count",
+                "last_seen",
+                "bounce_type",
+                "bounce_subtype",
+                "diagnostic_code",
+                "last_subject",
+                "last_message_id",
+                "last_ses_message_id",
+            ],
+        )
+        writer.writeheader()
+        writer.writerows(report_csv_rows(report))
+        return
+
+    print("SES Bounceback Triage Recommendations")
+    print("===========================")
     print(f"Database: {db_path}")
-    print(f"Raw events: {total_events}")
-    print(f"Recipient rows: {total_recipients}")
-    print(f"Distinct suppression emails: {distinct_emails}")
-    print(f"Transient emails: {transient_emails}")
+    print(f"Generated at: {report['generated_at']}")
+    summary = report["summary"]
+    print(f"Total addresses: {summary['total_addresses']}")
+    print(f"Recommended removals: {summary['remove now']}")
+    print(f"Recommended watch: {summary['watch']}")
+    print(f"Recommended ignores: {summary['ignore for now']}")
     if last_sync is not None:
         label, last_uid, updated_at = last_sync
         print(f"Last scan: label={label} last_uid={last_uid} updated_at={updated_at}")
     print()
 
-    print("Bounce counts by type/subtype")
-    print("----------------------------")
-    type_rows = [
-        (row[0], row[1], int(row[2]))
-        for row in conn.execute(
-            """
-            SELECT
-                COALESCE(br.bounce_type, 'Unknown') AS bounce_type,
-                COALESCE(br.bounce_subtype, 'Unknown') AS bounce_subtype,
-                COUNT(*) AS count
-            FROM bounce_recipients br
-            GROUP BY bounce_type, bounce_subtype
-            ORDER BY count DESC, bounce_type ASC, bounce_subtype ASC
-            """
-        ).fetchall()
-    ]
-    if not type_rows:
-        print("No bounce rows found.")
-    else:
-        for bounce_type, bounce_subtype, count in type_rows:
-            print(f"{count:>6}  {bounce_type} / {bounce_subtype}")
-    print()
-
-    rows = query_suppression_rows(conn, limit=limit)
-    print(f"Suppression candidates (showing up to {limit})")
-    print("-----------------------------------------")
-    if not rows:
-        print("No suppression candidates found.")
-        return
-
-    for row in rows:
-        print(
-            f"{row['email_address']} | last_seen={row['last_seen']} | count={row['bounce_count']} | "
-            f"type={row['bounce_type']} | subtype={row['bounce_subtype']} | reason={row['diagnostic_code']}"
-        )
-
-    transient_rows = query_transient_review_rows(conn, limit=limit)
-    print()
-    print(f"Transient review (3-hit rule, showing up to {limit})")
-    print("---------------------------------------------------")
-    if not transient_rows:
-        print("No transient bounce rows found.")
-        return
-
-    for row in transient_rows:
-        count = int(row["transient_count"])
-        if count >= 3:
-            action = "suppress now"
-        elif count == 2:
-            action = "watch"
-        else:
-            action = "ignore"
-        print(
-            f"{row['email_address']} | count={count} | action={action} | "
-            f"last_seen={row['last_seen']} | subtype={row['bounce_subtype']} | reason={row['diagnostic_code']}"
-        )
+    for section in report["sections"]:
+        rows = section["rows"]
+        print(section["title"])
+        print("-" * len(section["title"]))
+        print(section["subtitle"])
+        print(f"Showing up to {limit} rows.")
+        if not rows:
+            print("No rows in this section.")
+            print()
+            continue
+        for row in rows:
+            refs = " / ".join(
+                value
+                for value in (
+                    str(row.get("last_message_id") or "").strip(),
+                    str(row.get("last_ses_message_id") or "").strip(),
+                )
+                if value
+            )
+            print(
+                f"{row['email_address']} | recommendation={row['decision_bucket']} | reason={row['decision_reason']} | "
+                f"total={row['total_count']} | permanent={row['permanent_count']} | transient={row['transient_count']} | "
+                f"last_seen={row['last_seen']} | type={row['bounce_type']} | subtype={row['bounce_subtype']} | "
+                f"diagnostic={row['diagnostic_code']} | subject={row['last_subject']} | refs={refs}"
+            )
+        print()
 
 
 def export_suppressions(conn, output: str, fmt: str) -> None:
@@ -526,7 +571,7 @@ def main() -> None:
     conn = connect_db(config.db_path, config.label)
     try:
         if args.command == "report":
-            print_report(conn, config.db_path, limit=args.limit)
+            emit_report(conn, config.db_path, limit=args.limit, fmt=args.format, bucket=args.bucket)
         elif args.command == "export-suppressions":
             export_suppressions(conn, args.output, args.format)
         else:

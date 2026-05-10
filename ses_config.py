@@ -46,6 +46,7 @@ class WebConfig:
     forwarded_allow_ips: str = "127.0.0.1"
     verify_sns: bool = True
     unsafe_skip_sns_verify: bool = False
+    report_token: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -147,6 +148,7 @@ def _overlay_file(config: ServiceConfig, data: dict[str, Any]) -> ServiceConfig:
                     web.get("unsafe_skip_sns_verify", result.web.unsafe_skip_sns_verify),
                     key="web.unsafe_skip_sns_verify",
                 ),
+                report_token=web.get("report_token", result.web.report_token),
             ),
         )
     if logging_config:
@@ -207,6 +209,7 @@ def _overlay_env(config: ServiceConfig) -> ServiceConfig:
             _env("SES_BOUNCE_UNSAFE_SKIP_SNS_VERIFY") or config.web.unsafe_skip_sns_verify,
             key="SES_BOUNCE_UNSAFE_SKIP_SNS_VERIFY",
         ),
+        report_token=_env("SES_BOUNCE_REPORT_TOKEN") or config.web.report_token,
     )
     logging_config = replace(
         config.logging,

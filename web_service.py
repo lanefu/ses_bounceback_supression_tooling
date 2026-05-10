@@ -3,18 +3,25 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import logging
+from io import StringIO
+from html import escape
+from urllib.parse import urlencode
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 from aws_suppression import ses_client, sync_candidate_rows
 from bounceback_store import (
     connect_db,
     count_bounce_events,
+    build_triage_report,
     insert_bounce_event,
     latest_suppression_row_for_email,
+    normalize_triage_bucket_filter,
     successful_suppression_exists,
 )
 from logging_config import configure_logging
@@ -43,6 +50,289 @@ class RootPathPrefixMiddleware:
         await self.app(scope, receive, send)
 
 
+def authorize_report_access(request: Request, report_token: str | None) -> None:
+    if not report_token:
+        return
+
+    presented_token = request.query_params.get("token")
+    if not presented_token:
+        auth_header = request.headers.get("authorization", "")
+        scheme, _, value = auth_header.partition(" ")
+        if scheme.lower() == "bearer":
+            presented_token = value.strip()
+
+    if presented_token != report_token:
+        raise HTTPException(
+            status_code=401,
+            detail="Missing or invalid report token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+
+def get_report_token(request: Request, report_token: str | None) -> str | None:
+    if not report_token:
+        return None
+    token = request.query_params.get("token")
+    if token:
+        return token
+    auth_header = request.headers.get("authorization", "")
+    scheme, _, value = auth_header.partition(" ")
+    if scheme.lower() == "bearer":
+        candidate = value.strip()
+        if candidate:
+            return candidate
+    return None
+
+
+def build_report_href(
+    path: str,
+    *,
+    token: str | None = None,
+    bucket: str | None = None,
+    limit: int | None = None,
+) -> str:
+    params: dict[str, Any] = {}
+    if token:
+        params["token"] = token
+    if bucket:
+        params["bucket"] = bucket
+    if limit is not None:
+        params["limit"] = limit
+    if not params:
+        return path
+    return f"{path}?{urlencode(params)}"
+
+
+def resolve_triage_bucket(bucket: str | None) -> str | None:
+    if bucket is None:
+        return None
+    try:
+        return normalize_triage_bucket_filter(bucket)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+def triage_bucket_slug(bucket: str | None) -> str | None:
+    if bucket is None:
+        return None
+    normalized = normalize_triage_bucket_filter(bucket)
+    if normalized == "remove now":
+        return "remove-now"
+    if normalized == "watch":
+        return "watch"
+    if normalized == "ignore for now":
+        return "ignore-for-now"
+    return None
+
+
+def render_triage_html(report: dict[str, Any], *, report_token: str | None = None) -> str:
+    summary = report.get("summary", {})
+    sections = report.get("sections", [])
+    current_bucket = report.get("bucket_filter")
+    current_bucket_slug = triage_bucket_slug(current_bucket)
+    csv_href = build_report_href("/reports/triage.csv", token=report_token, bucket=current_bucket_slug)
+    json_href = build_report_href("/reports/triage.json", token=report_token, bucket=current_bucket_slug)
+    filter_links = [
+        ("All recommendations", None),
+        ("Recommended removals", "remove-now"),
+        ("Recommended watch", "watch"),
+        ("Recommended ignores", "ignore-for-now"),
+    ]
+    lines = [
+        "<!doctype html>",
+        "<html lang='en'>",
+        "<head>",
+        "<meta charset='utf-8'>",
+        "<meta name='viewport' content='width=device-width, initial-scale=1'>",
+        "<title>SES Bounce Triage Recommendations</title>",
+        "<style>",
+        "body{font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;margin:2rem;color:#1f2937;background:#f8fafc;}",
+        "main{max-width:1400px;margin:0 auto;}",
+        "h1,h2,h3,p{margin:0 0 0.75rem 0;}",
+        ".summary{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:0.75rem;margin:1rem 0 2rem;}",
+        ".card{background:#fff;border:1px solid #dbe2ea;border-radius:12px;padding:1rem;box-shadow:0 1px 2px rgba(15,23,42,0.05);}",
+        ".card strong{display:block;font-size:1.6rem;line-height:1.1;margin-top:0.35rem;}",
+        ".cardlink{display:block;text-decoration:none;color:inherit;}",
+        ".cardlink.active{border-color:#7c3aed;box-shadow:0 0 0 1px rgba(124,58,237,0.25),0 1px 2px rgba(15,23,42,0.05);}",
+        ".filters{display:flex;gap:0.5rem;flex-wrap:wrap;margin:0 0 1rem 0;}",
+        ".filters a{display:inline-block;padding:0.45rem 0.75rem;border-radius:999px;border:1px solid #dbe2ea;background:#fff;color:#334155;text-decoration:none;}",
+        ".filters a.active{background:#0f172a;color:#fff;border-color:#0f172a;}",
+        ".section{margin:1.5rem 0 2rem;}",
+        ".section header{display:flex;flex-direction:column;gap:0.25rem;margin-bottom:0.75rem;}",
+        ".section-actions{display:flex;gap:0.5rem;flex-wrap:wrap;align-items:center;}",
+        ".section-actions a{display:inline-block;padding:0.35rem 0.6rem;border-radius:0.5rem;border:1px solid #dbe2ea;background:#fff;color:#334155;text-decoration:none;font-size:0.85rem;}",
+        ".section table{width:100%;border-collapse:collapse;background:#fff;border:1px solid #dbe2ea;border-radius:12px;overflow:hidden;}",
+        "th,td{padding:0.7rem 0.8rem;border-bottom:1px solid #e5e7eb;vertical-align:top;text-align:left;font-size:0.93rem;}",
+        "th{background:#eef2f7;font-size:0.82rem;text-transform:uppercase;letter-spacing:0.04em;}",
+        "tr:last-child td{border-bottom:none;}",
+        ".muted{color:#6b7280;}",
+        ".badge{display:inline-block;padding:0.16rem 0.45rem;border-radius:999px;font-size:0.78rem;font-weight:600;background:#e5e7eb;}",
+        ".remove{background:#fee2e2;color:#991b1b;}",
+        ".watch{background:#fef3c7;color:#92400e;}",
+        ".ignore{background:#dbeafe;color:#1d4ed8;}",
+        "a.download{display:inline-block;margin-right:0.75rem;padding:0.5rem 0.8rem;border-radius:0.6rem;background:#0f172a;color:#fff;text-decoration:none;font-size:0.9rem;}",
+        "a.download:hover{background:#1e293b;}",
+        "code{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;}",
+        "</style>",
+        "</head>",
+        "<body>",
+        "<main>",
+        "<h1>SES Bounce Triage Recommendations</h1>",
+        "<p class='muted'>These are the app's recommended dispositions, not click-to-act controls.</p>",
+        f"<p class='muted'>Generated at {escape(str(report.get('generated_at', '')))}</p>",
+        "<div class='filters'>",
+    ]
+
+    for label, bucket_value in filter_links:
+        href = build_report_href("/reports/triage", token=report_token, bucket=bucket_value)
+        active = " active" if ((bucket_value is None and current_bucket is None) or bucket_value == current_bucket) else ""
+        lines.append(f"<a class='{active.strip()}' href='{escape(href)}'>{escape(label)}</a>")
+    lines.append("</div>")
+    lines.append("<p>")
+    lines.append(f"<a class='download' href='{escape(csv_href)}'>Download CSV</a>")
+    lines.append(f"<a class='download' href='{escape(json_href)}'>Download JSON</a>")
+    lines.append("</p>")
+    lines.append("<div class='summary'>")
+
+    summary_items = [
+        ("Total addresses", summary.get("total_addresses", 0), None),
+        ("Recommended removals", summary.get("remove now", 0), "remove-now"),
+        ("Recommended watch", summary.get("watch", 0), "watch"),
+        ("Recommended ignores", summary.get("ignore for now", 0), "ignore-for-now"),
+    ]
+    for label, value, bucket_value in summary_items:
+        href = build_report_href("/reports/triage", token=report_token, bucket=bucket_value)
+        active = " active" if ((bucket_value is None and current_bucket is None) or bucket_value == current_bucket) else ""
+        lines.extend(
+            [
+                f"<a class='card cardlink{active}' href='{escape(href)}'>",
+                f"<span class='muted'>{escape(str(label))}</span>",
+                f"<strong>{escape(str(value))}</strong>",
+                "</a>",
+            ]
+        )
+
+    lines.append("</div>")
+    for section in sections:
+        rows = section.get("rows", [])
+        badge_class = "remove" if section.get("bucket") == "remove now" else "watch" if section.get("bucket") == "watch" else "ignore"
+        bucket_slug = "remove-now" if section.get("bucket") == "remove now" else "watch" if section.get("bucket") == "watch" else "ignore-for-now"
+        view_href = build_report_href("/reports/triage", token=report_token, bucket=bucket_slug)
+        csv_section_href = build_report_href("/reports/triage.csv", token=report_token, bucket=bucket_slug)
+        json_section_href = build_report_href("/reports/triage.json", token=report_token, bucket=bucket_slug)
+        lines.extend(
+            [
+                f"<section class='section' id='{escape(str(section.get('key', '')))}'>",
+                "<header>",
+                f"<h2>{escape(str(section.get('title', '')))}</h2>",
+                f"<p class='muted'>{escape(str(section.get('subtitle', '')))}</p>",
+                "<div class='section-actions'>",
+                f"<span><span class='badge {badge_class}'>{escape(str(section.get('bucket', '')))}</span> <span class='muted'>Rows shown: {len(rows)}</span></span>",
+                f"<a href='{escape(view_href)}'>View bucket</a>",
+                f"<a href='{escape(csv_section_href)}'>CSV</a>",
+                f"<a href='{escape(json_section_href)}'>JSON</a>",
+                "</div>",
+                "</header>",
+            ]
+        )
+        if not rows:
+            lines.append("<p class='muted'>No rows in this section.</p>")
+        else:
+            lines.extend(
+                [
+                    "<table>",
+                    "<thead>",
+                    "<tr>",
+                    "<th>Email</th>",
+                    "<th>Recommendation</th>",
+                    "<th>Counts</th>",
+                    "<th>Last seen</th>",
+                    "<th>Bounce type</th>",
+                    "<th>Subtype</th>",
+                    "<th>Diagnostic</th>",
+                    "<th>Last subject</th>",
+                    "<th>References</th>",
+                    "</tr>",
+                    "</thead>",
+                    "<tbody>",
+                ]
+            )
+            for row in rows:
+                refs = " / ".join(
+                    part
+                    for part in (
+                        str(row.get("last_message_id") or "").strip(),
+                        str(row.get("last_ses_message_id") or "").strip(),
+                    )
+                    if part
+                )
+                lines.extend(
+                    [
+                        "<tr>",
+                        f"<td><code>{escape(str(row.get('email_address', '')))}</code></td>",
+                        f"<td><span class='badge {badge_class}'>App recommendation: {escape(str(row.get('decision_bucket', '')))}</span><br><span class='muted'>{escape(str(row.get('decision_reason', '')))}</span></td>",
+                        f"<td>total {escape(str(row.get('total_count', 0)))}<br>permanent {escape(str(row.get('permanent_count', 0)))}<br>transient {escape(str(row.get('transient_count', 0)))}</td>",
+                        f"<td>{escape(str(row.get('last_seen', '')))}</td>",
+                        f"<td>{escape(str(row.get('bounce_type', '')))}</td>",
+                        f"<td>{escape(str(row.get('bounce_subtype', '')))}</td>",
+                        f"<td>{escape(str(row.get('diagnostic_code', '')))}</td>",
+                        f"<td>{escape(str(row.get('last_subject', '')))}</td>",
+                        f"<td>{escape(refs)}</td>",
+                        "</tr>",
+                    ]
+                )
+            lines.extend(["</tbody>", "</table>"])
+        lines.append("</section>")
+
+    lines.extend(["</main>", "</body>", "</html>"])
+    return "".join(lines)
+
+
+def render_triage_csv(report: dict[str, Any]) -> str:
+    buffer = StringIO()
+    writer = csv.DictWriter(
+        buffer,
+        fieldnames=[
+            "section",
+            "decision_bucket",
+            "decision_reason",
+            "email_address",
+            "total_count",
+            "permanent_count",
+            "transient_count",
+            "last_seen",
+            "bounce_type",
+            "bounce_subtype",
+            "diagnostic_code",
+            "last_subject",
+            "last_message_id",
+            "last_ses_message_id",
+        ],
+    )
+    writer.writeheader()
+    for section in report.get("sections", []):
+        for row in section.get("rows", []):
+            writer.writerow(
+                {
+                    "section": section.get("title", ""),
+                    "decision_bucket": row.get("decision_bucket", ""),
+                    "decision_reason": row.get("decision_reason", ""),
+                    "email_address": row.get("email_address", ""),
+                    "total_count": row.get("total_count", 0),
+                    "permanent_count": row.get("permanent_count", 0),
+                    "transient_count": row.get("transient_count", 0),
+                    "last_seen": row.get("last_seen", ""),
+                    "bounce_type": row.get("bounce_type", ""),
+                    "bounce_subtype": row.get("bounce_subtype", ""),
+                    "diagnostic_code": row.get("diagnostic_code", ""),
+                    "last_subject": row.get("last_subject", ""),
+                    "last_message_id": row.get("last_message_id", ""),
+                    "last_ses_message_id": row.get("last_ses_message_id", ""),
+                }
+            )
+    return buffer.getvalue()
+
+
 def create_app(config: ServiceConfig | None = None) -> FastAPI:
     config = config or load_config()
     configure_logging(config.logging)
@@ -68,6 +358,38 @@ def create_app(config: ServiceConfig | None = None) -> FastAPI:
             return {"status": "ok", "events": count_bounce_events(conn)}
         finally:
             conn.close()
+
+    def load_triage_report(limit: int | None = None, bucket: str | None = None) -> dict[str, Any]:
+        conn = connect_db(config.database.path, config.imap.label)
+        try:
+            return build_triage_report(conn, limit=limit, bucket=resolve_triage_bucket(bucket))
+        finally:
+            conn.close()
+
+    @app.get("/reports/triage", response_class=HTMLResponse)
+    def triage_report(request: Request, limit: int | None = None, bucket: str | None = None) -> HTMLResponse:
+        authorize_report_access(request, config.web.report_token)
+        report = load_triage_report(limit=limit, bucket=bucket)
+        return HTMLResponse(render_triage_html(report, report_token=get_report_token(request, config.web.report_token)))
+
+    @app.get("/reports/triage.json")
+    def triage_report_json(request: Request, limit: int | None = None, bucket: str | None = None) -> JSONResponse:
+        authorize_report_access(request, config.web.report_token)
+        report = load_triage_report(limit=limit, bucket=bucket)
+        return JSONResponse(
+            content=report,
+            headers={"Content-Disposition": f'attachment; filename="ses-bounce-triage{("-" + bucket.replace(" ", "-") if bucket else "")}.json"'},
+        )
+
+    @app.get("/reports/triage.csv")
+    def triage_report_csv(request: Request, limit: int | None = None, bucket: str | None = None) -> Response:
+        authorize_report_access(request, config.web.report_token)
+        report = load_triage_report(limit=limit, bucket=bucket)
+        return Response(
+            content=render_triage_csv(report),
+            media_type="text/csv; charset=utf-8",
+            headers={"Content-Disposition": f'attachment; filename="ses-bounce-triage{("-" + bucket.replace(" ", "-") if bucket else "")}.csv"'},
+        )
 
     @app.post("/sns/bounce")
     async def sns_bounce(request: Request) -> dict[str, Any]:

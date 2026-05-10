@@ -691,6 +691,192 @@ def query_transient_review_rows(
     return [dict(row) for row in conn.execute(sql, params).fetchall()]
 
 
+def triage_bucket_for_counts(permanent_count: int, transient_count: int) -> tuple[str, str, int]:
+    if permanent_count > 0:
+        return "remove now", "Permanent bounce observed", 0
+    if transient_count >= 3:
+        return "remove now", "Transient bounce reached 3-hit rule", 0
+    if transient_count == 2:
+        return "watch", "Transient bounce reached 2-hit watch threshold", 1
+    return "ignore for now", "Single transient bounce", 2
+
+
+def normalize_triage_bucket_filter(bucket: Optional[str]) -> Optional[str]:
+    if bucket is None:
+        return None
+    normalized = bucket.strip().lower().replace("_", "-")
+    if not normalized:
+        return None
+    mapping = {
+        "remove-now": "remove now",
+        "remove now": "remove now",
+        "watch": "watch",
+        "ignore": "ignore for now",
+        "ignore-for-now": "ignore for now",
+        "ignore for now": "ignore for now",
+    }
+    if normalized not in mapping:
+        raise ValueError(f"Unsupported triage bucket filter: {bucket}")
+    return mapping[normalized]
+
+
+def query_address_triage_rows(
+    conn: sqlite3.Connection,
+    *,
+    limit: Optional[int] = None,
+    bucket: Optional[str] = None,
+) -> list[dict[str, Any]]:
+    bucket_filter = normalize_triage_bucket_filter(bucket)
+    sql = """
+        WITH ranked AS (
+            SELECT
+                lower(br.email_address) AS email_address,
+                COALESCE(be.bounce_timestamp, be.created_at) AS last_seen,
+                br.bounce_type,
+                br.bounce_subtype,
+                br.diagnostic_code,
+                be.subject,
+                be.message_id,
+                be.ses_message_id,
+                COUNT(*) OVER (PARTITION BY lower(br.email_address)) AS total_count,
+                SUM(
+                    CASE WHEN lower(COALESCE(br.bounce_type, '')) = lower('Permanent') THEN 1 ELSE 0 END
+                ) OVER (PARTITION BY lower(br.email_address)) AS permanent_count,
+                SUM(
+                    CASE WHEN lower(COALESCE(br.bounce_type, '')) = lower('Transient') THEN 1 ELSE 0 END
+                ) OVER (PARTITION BY lower(br.email_address)) AS transient_count,
+                ROW_NUMBER() OVER (
+                    PARTITION BY lower(br.email_address)
+                    ORDER BY COALESCE(be.bounce_timestamp, be.created_at) DESC, be.id DESC
+                ) AS rn
+            FROM bounce_recipients br
+            JOIN bounce_events be ON be.id = br.event_id
+        )
+        SELECT
+            email_address,
+            last_seen,
+            total_count,
+            permanent_count,
+            transient_count,
+            bounce_type,
+            bounce_subtype,
+            diagnostic_code,
+            subject AS last_subject,
+            message_id AS last_message_id,
+            ses_message_id AS last_ses_message_id
+        FROM ranked
+        WHERE rn = 1
+        ORDER BY
+            CASE
+                WHEN permanent_count > 0 THEN 0
+                WHEN transient_count >= 3 THEN 1
+                WHEN transient_count = 2 THEN 2
+                ELSE 3
+            END,
+            last_seen DESC,
+            email_address ASC
+    """
+    if bucket_filter:
+        sql = f"""
+            WITH base AS (
+                {sql}
+            )
+            SELECT *
+            FROM base
+            WHERE (
+                (? = 'remove now' AND (permanent_count > 0 OR transient_count >= 3))
+                OR (? = 'watch' AND transient_count = 2)
+                OR (? = 'ignore for now' AND transient_count <= 1 AND permanent_count = 0)
+            )
+        """
+    params: tuple[Any, ...] = ()
+    if limit is not None:
+        sql += " LIMIT ?"
+        params = (limit,)
+    if bucket_filter:
+        params = (bucket_filter, bucket_filter, bucket_filter) + params
+    rows = []
+    for row in conn.execute(sql, params).fetchall():
+        item = dict(row)
+        permanent_count = int(item.get("permanent_count") or 0)
+        transient_count = int(item.get("transient_count") or 0)
+        bucket, reason, priority = triage_bucket_for_counts(permanent_count, transient_count)
+        item["decision_bucket"] = bucket
+        item["decision_reason"] = reason
+        item["decision_priority"] = priority
+        item["total_count"] = int(item.get("total_count") or 0)
+        rows.append(item)
+    return rows
+
+
+def build_triage_report(
+    conn: sqlite3.Connection,
+    *,
+    limit: Optional[int] = None,
+    bucket: Optional[str] = None,
+) -> dict[str, Any]:
+    bucket_filter = normalize_triage_bucket_filter(bucket)
+    rows = query_address_triage_rows(conn, bucket=bucket_filter)
+    summary_rows = {
+        "remove now": 0,
+        "watch": 0,
+        "ignore for now": 0,
+    }
+    for row in rows:
+        summary_rows[row["decision_bucket"]] += 1
+
+    def _section_rows(section_bucket: str) -> list[dict[str, Any]]:
+        return [row for row in rows if row["decision_bucket"] == section_bucket]
+
+    sections = [
+        {
+            "key": "remove-now-permanent",
+            "title": "Recommended removals - permanent",
+            "subtitle": "Permanent SES bounces are the clearest removal recommendations.",
+            "bucket": "remove now",
+            "rows": [row for row in _section_rows("remove now") if int(row["permanent_count"]) > 0],
+        },
+        {
+            "key": "remove-now-transient",
+            "title": "Recommended removals - transient repeaters",
+            "subtitle": "Transient addresses that crossed the 3-hit rule are recommended for removal now.",
+            "bucket": "remove now",
+            "rows": [row for row in _section_rows("remove now") if int(row["permanent_count"]) == 0],
+        },
+        {
+            "key": "watch",
+            "title": "Recommended watch",
+            "subtitle": "These addresses have bounced twice and are recommended for follow-up before removal.",
+            "bucket": "watch",
+            "rows": _section_rows("watch"),
+        },
+        {
+            "key": "ignore",
+            "title": "Recommended ignores",
+            "subtitle": "A single transient bounce is usually noise unless it repeats.",
+            "bucket": "ignore for now",
+            "rows": _section_rows("ignore for now"),
+        },
+    ]
+
+    if limit is not None:
+        for section in sections:
+            section["rows"] = section["rows"][:limit]
+
+    if bucket_filter is not None:
+        sections = [section for section in sections if section["bucket"] == bucket_filter]
+
+    return {
+        "generated_at": utc_now(),
+        "bucket_filter": bucket_filter,
+        "summary": {
+            "total_addresses": len(rows),
+            **summary_rows,
+        },
+        "sections": sections,
+    }
+
+
 def count_transient_bounce_emails(conn: sqlite3.Connection) -> int:
     return scalar_count(
         conn,

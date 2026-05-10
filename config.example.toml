@@ -24,6 +24,7 @@ proxy_headers = false
 forwarded_allow_ips = "127.0.0.1"
 verify_sns = true
 unsafe_skip_sns_verify = false
+# report_token = "long-lived-report-secret"
 
 [logging]
 level = "INFO"

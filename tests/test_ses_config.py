@@ -40,6 +40,7 @@ proxy_headers = false
 forwarded_allow_ips = "10.0.0.0/8"
 verify_sns = false
 unsafe_skip_sns_verify = false
+report_token = "file-token"
 
 [logging]
 level = "warning"
@@ -77,6 +78,7 @@ resource_attributes = "env=file"
     monkeypatch.setenv("SES_BOUNCE_LOG_FORMAT", "json")
     monkeypatch.setenv("SES_BOUNCE_ACCESS_LOG", "true")
     monkeypatch.setenv("SES_BOUNCE_UVICORN_LOG_LEVEL", "error")
+    monkeypatch.setenv("SES_BOUNCE_REPORT_TOKEN", "env-token")
     monkeypatch.setenv("OTEL_SERVICE_NAME", "env-service")
     monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://env-otel:4317")
     monkeypatch.setenv("OTEL_RESOURCE_ATTRIBUTES", "env=env")
@@ -111,6 +113,7 @@ resource_attributes = "env=file"
     assert config.web.forwarded_allow_ips == "127.0.0.1,10.0.0.0/8"
     assert config.web.verify_sns is True
     assert config.web.unsafe_skip_sns_verify is False
+    assert config.web.report_token == "env-token"
     assert config.logging.level == "critical"
     assert config.logging.format == "text"
     assert config.logging.access_log is True

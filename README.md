@@ -19,6 +19,7 @@ This repo ingests SES bouncebacks into SQLite, then uses that database to seed a
   - FastAPI SNS webhook service
   - stores bounce notifications in SQLite
   - writes `Permanent` bounces to SES account-level suppression inline
+  - serves decision-oriented triage reports over authenticated HTTP
 - `seed_store.py`
   - exports, validates, and imports full SQLite seed bundles
 - `ses_config.py`
@@ -36,7 +37,7 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Run local commands from the activated `.venv`.
+Use that environment for the commands below.
 
 ## Configuration
 
@@ -52,7 +53,7 @@ Start with:
 cp config.example.toml config.local.toml
 ```
 
-Use `--config config.local.toml` with the CLI tools or set:
+Use `--config config.local.toml` with the CLI tools, or set:
 
 ```bash
 export SES_BOUNCE_CONFIG=config.local.toml
@@ -85,6 +86,7 @@ The webhook service also reads:
 - `SES_BOUNCE_FORWARDED_ALLOW_IPS` defaults to `127.0.0.1`
 - `SES_BOUNCE_VERIFY_SNS` defaults to `true`
 - `SES_BOUNCE_UNSAFE_SKIP_SNS_VERIFY` defaults to `false`
+- `SES_BOUNCE_REPORT_TOKEN` enables report endpoint protection
 - `SES_BOUNCE_LOG_LEVEL` defaults to `INFO`
 - `SES_BOUNCE_LOG_FORMAT` defaults to `text`
 - `SES_BOUNCE_ACCESS_LOG` defaults to `true`
@@ -99,11 +101,19 @@ Ingest bouncebacks:
 python fetch_bouncebacks.py sync
 ```
 
-Report on the database:
+Decision-oriented report:
 
 ```bash
 python fetch_bouncebacks.py report
+python fetch_bouncebacks.py report --format json
+python fetch_bouncebacks.py report --format csv
+python fetch_bouncebacks.py report --bucket remove-now --format csv
 ```
+
+- These are the app's recommendations, not action buttons.
+- `Recommended removals` for permanent bounces and transient addresses that crossed the 3-hit rule
+- `Recommended watch` for transient addresses with 2 hits
+- `Recommended ignores` for one-off transients
 
 Export suppression candidates:
 
@@ -146,6 +156,35 @@ Health checks:
 ```bash
 curl http://127.0.0.1:8000/healthz
 curl http://127.0.0.1:8000/readyz
+```
+
+To protect the triage report endpoints, set a long-lived token with either:
+
+```bash
+export SES_BOUNCE_REPORT_TOKEN='replace-me'
+```
+
+or in `config.local.toml`:
+
+```toml
+[web]
+report_token = "replace-me"
+```
+
+If the token is unset, the report endpoints stay open for local development.
+
+Triage reports:
+
+```bash
+curl -H "Authorization: Bearer $SES_BOUNCE_REPORT_TOKEN" http://127.0.0.1:8000/reports/triage
+curl -H "Authorization: Bearer $SES_BOUNCE_REPORT_TOKEN" http://127.0.0.1:8000/reports/triage.json
+curl -H "Authorization: Bearer $SES_BOUNCE_REPORT_TOKEN" http://127.0.0.1:8000/reports/triage.csv
+```
+
+For quick browser access, you can also use:
+
+```text
+http://127.0.0.1:8000/reports/triage?token=replace-me
 ```
 
 SNS should deliver HTTP/S notifications to:
