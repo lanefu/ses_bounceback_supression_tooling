@@ -87,10 +87,14 @@ def get_report_token(request: Request, report_token: str | None) -> str | None:
 def build_report_href(
     path: str,
     *,
+    root_path: str = "",
     token: str | None = None,
     bucket: str | None = None,
     limit: int | None = None,
 ) -> str:
+    base_path = path if path.startswith("/") else f"/{path}"
+    normalized_root = root_path.rstrip("/")
+    full_path = f"{normalized_root}{base_path}" if normalized_root else base_path
     params: dict[str, Any] = {}
     if token:
         params["token"] = token
@@ -99,8 +103,8 @@ def build_report_href(
     if limit is not None:
         params["limit"] = limit
     if not params:
-        return path
-    return f"{path}?{urlencode(params)}"
+        return full_path
+    return f"{full_path}?{urlencode(params)}"
 
 
 def resolve_triage_bucket(bucket: str | None) -> str | None:
@@ -125,13 +129,19 @@ def triage_bucket_slug(bucket: str | None) -> str | None:
     return None
 
 
-def render_triage_html(report: dict[str, Any], *, report_token: str | None = None) -> str:
+def render_triage_html(
+    report: dict[str, Any], *, report_token: str | None = None, root_path: str = ""
+) -> str:
     summary = report.get("summary", {})
     sections = report.get("sections", [])
     current_bucket = report.get("bucket_filter")
     current_bucket_slug = triage_bucket_slug(current_bucket)
-    csv_href = build_report_href("/reports/triage.csv", token=report_token, bucket=current_bucket_slug)
-    json_href = build_report_href("/reports/triage.json", token=report_token, bucket=current_bucket_slug)
+    csv_href = build_report_href(
+        "/reports/triage.csv", root_path=root_path, token=report_token, bucket=current_bucket_slug
+    )
+    json_href = build_report_href(
+        "/reports/triage.json", root_path=root_path, token=report_token, bucket=current_bucket_slug
+    )
     filter_links = [
         ("All recommendations", None),
         ("Recommended removals", "remove-now"),
@@ -184,7 +194,7 @@ def render_triage_html(report: dict[str, Any], *, report_token: str | None = Non
     ]
 
     for label, bucket_value in filter_links:
-        href = build_report_href("/reports/triage", token=report_token, bucket=bucket_value)
+        href = build_report_href("/reports/triage", root_path=root_path, token=report_token, bucket=bucket_value)
         active = " active" if ((bucket_value is None and current_bucket is None) or bucket_value == current_bucket) else ""
         lines.append(f"<a class='{active.strip()}' href='{escape(href)}'>{escape(label)}</a>")
     lines.append("</div>")
@@ -201,7 +211,7 @@ def render_triage_html(report: dict[str, Any], *, report_token: str | None = Non
         ("Recommended ignores", summary.get("ignore for now", 0), "ignore-for-now"),
     ]
     for label, value, bucket_value in summary_items:
-        href = build_report_href("/reports/triage", token=report_token, bucket=bucket_value)
+        href = build_report_href("/reports/triage", root_path=root_path, token=report_token, bucket=bucket_value)
         active = " active" if ((bucket_value is None and current_bucket is None) or bucket_value == current_bucket) else ""
         lines.extend(
             [
@@ -217,9 +227,13 @@ def render_triage_html(report: dict[str, Any], *, report_token: str | None = Non
         rows = section.get("rows", [])
         badge_class = "remove" if section.get("bucket") == "remove now" else "watch" if section.get("bucket") == "watch" else "ignore"
         bucket_slug = "remove-now" if section.get("bucket") == "remove now" else "watch" if section.get("bucket") == "watch" else "ignore-for-now"
-        view_href = build_report_href("/reports/triage", token=report_token, bucket=bucket_slug)
-        csv_section_href = build_report_href("/reports/triage.csv", token=report_token, bucket=bucket_slug)
-        json_section_href = build_report_href("/reports/triage.json", token=report_token, bucket=bucket_slug)
+        view_href = build_report_href("/reports/triage", root_path=root_path, token=report_token, bucket=bucket_slug)
+        csv_section_href = build_report_href(
+            "/reports/triage.csv", root_path=root_path, token=report_token, bucket=bucket_slug
+        )
+        json_section_href = build_report_href(
+            "/reports/triage.json", root_path=root_path, token=report_token, bucket=bucket_slug
+        )
         lines.extend(
             [
                 f"<section class='section' id='{escape(str(section.get('key', '')))}'>",
@@ -370,7 +384,13 @@ def create_app(config: ServiceConfig | None = None) -> FastAPI:
     def triage_report(request: Request, limit: int | None = None, bucket: str | None = None) -> HTMLResponse:
         authorize_report_access(request, config.web.report_token)
         report = load_triage_report(limit=limit, bucket=bucket)
-        return HTMLResponse(render_triage_html(report, report_token=get_report_token(request, config.web.report_token)))
+        return HTMLResponse(
+            render_triage_html(
+                report,
+                report_token=get_report_token(request, config.web.report_token),
+                root_path=str(request.scope.get("root_path") or ""),
+            )
+        )
 
     @app.get("/reports/triage.json")
     def triage_report_json(request: Request, limit: int | None = None, bucket: str | None = None) -> JSONResponse:

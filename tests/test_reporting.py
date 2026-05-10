@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 from contextlib import redirect_stdout
+from dataclasses import replace
 
 from bounceback_store import build_triage_report, connect_db, insert_bounce_event
 from ses_config import AwsConfig, DatabaseConfig, ImapConfig, ServiceConfig, WebConfig
@@ -259,3 +260,56 @@ def test_report_endpoints_require_token_and_return_matching_data(tmp_path):
     assert csv_response.headers["content-disposition"] == 'attachment; filename="ses-bounce-triage.csv"'
     assert "section,decision_bucket,decision_reason,email_address" in csv_response.text
     assert "perm@example.com" in csv_response.text
+
+
+def test_report_html_links_include_root_path(tmp_path):
+    db_path = str(tmp_path / "bouncebacks.sqlite3")
+    conn = connect_db(db_path, "test-label")
+    try:
+        _insert_bounce(
+            conn,
+            email_address="perm@example.com",
+            bounce_type="Permanent",
+            timestamp="2026-05-09T12:30:00Z",
+            message_id="message-perm-1",
+            sns_message_id="sns-perm-1",
+        )
+        _insert_bounce(
+            conn,
+            email_address="watch@example.com",
+            bounce_type="Transient",
+            timestamp="2026-05-09T12:40:00Z",
+            message_id="message-watch-1",
+            sns_message_id="sns-watch-1",
+        )
+        _insert_bounce(
+            conn,
+            email_address="watch@example.com",
+            bounce_type="Transient",
+            timestamp="2026-05-09T12:50:00Z",
+            message_id="message-watch-2",
+            sns_message_id="sns-watch-2",
+        )
+    finally:
+        conn.close()
+
+    config = replace(
+        _triage_config(db_path, report_token="report-secret"),
+        web=replace(
+            _triage_config(db_path, report_token="report-secret").web,
+            root_path="/proxy-prefix",
+        ),
+    )
+    client = TestClient(web_service.create_app(config))
+
+    tokenized_html = client.get("/proxy-prefix/reports/triage?token=report-secret")
+    assert tokenized_html.status_code == 200
+    assert "/proxy-prefix/reports/triage?token=report-secret" in tokenized_html.text
+    assert "/proxy-prefix/reports/triage.csv?token=report-secret" in tokenized_html.text
+    assert "/proxy-prefix/reports/triage.json?token=report-secret" in tokenized_html.text
+
+    remove_now = client.get("/proxy-prefix/reports/triage?token=report-secret&bucket=remove-now")
+    assert remove_now.status_code == 200
+    assert "/proxy-prefix/reports/triage?token=report-secret&amp;bucket=remove-now" in remove_now.text
+    assert "/proxy-prefix/reports/triage.csv?token=report-secret&amp;bucket=remove-now" in remove_now.text
+    assert "/proxy-prefix/reports/triage.json?token=report-secret&amp;bucket=remove-now" in remove_now.text
