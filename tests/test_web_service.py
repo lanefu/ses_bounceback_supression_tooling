@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
 
 from fastapi.testclient import TestClient
 
 import web_service
 from bounceback_store import count_bounce_events, count_successful_suppression_submissions, connect_db
-from ses_config import AwsConfig, DatabaseConfig, ImapConfig, ServiceConfig, WebConfig
+from ses_config import AwsConfig, DatabaseConfig, ImapConfig, LoggingConfig, ServiceConfig, WebConfig
 
 
 def _config(db_path: str, *, verify_sns: bool = False, unsafe_skip_sns_verify: bool = True) -> ServiceConfig:
@@ -88,6 +89,57 @@ def test_webhook_rejects_bad_sns_signature(tmp_path, monkeypatch):
 
     assert response.status_code == 403
     assert "Invalid SNS signature" in response.json()["detail"]
+
+
+def test_webhook_logs_trace_context_within_request(tmp_path, monkeypatch, capsys):
+    db_path = str(tmp_path / "bouncebacks.sqlite3")
+    calls: list[dict[str, str]] = []
+
+    class FakeSesClient:
+        def put_suppressed_destination(self, **kwargs):
+            calls.append(kwargs)
+
+    @contextmanager
+    def fake_latency(histogram, attributes=None):
+        from opentelemetry.trace import NonRecordingSpan, SpanContext, TraceFlags, TraceState, use_span
+
+        span_context = SpanContext(
+            trace_id=0x1234567890ABCDEF1234567890ABCDEF,
+            span_id=0x1234567890ABCDEF,
+            is_remote=False,
+            trace_flags=TraceFlags(TraceFlags.SAMPLED),
+            trace_state=TraceState(),
+        )
+        with use_span(NonRecordingSpan(span_context), end_on_exit=False):
+            yield
+
+    monkeypatch.setattr(web_service, "ses_client", lambda profile, region: FakeSesClient())
+    monkeypatch.setattr(web_service.telemetry, "latency", fake_latency)
+    config = ServiceConfig(
+        database=DatabaseConfig(path=db_path),
+        imap=ImapConfig(label="test-label"),
+        aws=AwsConfig(region="us-east-1", retry_count=0, delay_seconds=0.0),
+        web=WebConfig(verify_sns=False, unsafe_skip_sns_verify=True),
+        logging=LoggingConfig(level="INFO", format="json", access_log=False, uvicorn_log_level="error"),
+    )
+    client = TestClient(web_service.create_app(config))
+
+    response = client.post("/sns/bounce", json=_sns_notification())
+
+    assert response.status_code == 200
+    assert calls == [{"EmailAddress": "user@example.com", "Reason": "BOUNCE"}]
+
+    lines = [line for line in capsys.readouterr().out.splitlines() if line.strip()]
+    parsed = []
+    for line in lines:
+        try:
+            parsed.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+
+    matching = [entry for entry in parsed if entry.get("message") in {"SNS message received", "Bounce event processed"}]
+    assert matching, f"expected request logs in output, got: {lines}"
+    assert any(entry.get("trace_id") and entry.get("span_id") for entry in matching)
 
 
 def test_create_app_honors_root_path(tmp_path):

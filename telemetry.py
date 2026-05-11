@@ -42,9 +42,11 @@ class Telemetry:
 
 
 telemetry = Telemetry()
+_otel_initialized = False
 
 
 def configure_telemetry(service_name: str, endpoint: Optional[str] = None, resource_attributes: Optional[str] = None) -> None:
+    global _otel_initialized
     configured_endpoint = endpoint or os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT")
     if not configured_endpoint:
         os.environ.setdefault("OTEL_SERVICE_NAME", service_name)
@@ -53,6 +55,8 @@ def configure_telemetry(service_name: str, endpoint: Optional[str] = None, resou
     if resource_attributes:
         os.environ.setdefault("OTEL_RESOURCE_ATTRIBUTES", resource_attributes)
     os.environ.setdefault("OTEL_SERVICE_NAME", service_name)
+    if _otel_initialized:
+        return
 
     try:
         from opentelemetry import metrics, trace
@@ -74,6 +78,7 @@ def configure_telemetry(service_name: str, endpoint: Optional[str] = None, resou
 
         metric_reader = PeriodicExportingMetricReader(OTLPMetricExporter())
         metrics.set_meter_provider(MeterProvider(resource=resource, metric_readers=[metric_reader]))
+        _otel_initialized = True
     except Exception:
         return
 

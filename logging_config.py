@@ -11,6 +11,37 @@ from typing import Any
 from ses_config import LoggingConfig
 
 
+def _trace_context_fields() -> dict[str, str]:
+    try:
+        from opentelemetry import trace
+    except Exception:
+        return {}
+
+    try:
+        span = trace.get_current_span()
+        span_context = span.get_span_context()
+    except Exception:
+        return {}
+
+    if span_context is None or not span_context.is_valid:
+        return {}
+
+    return {
+        "trace_id": format(span_context.trace_id, "032x"),
+        "span_id": format(span_context.span_id, "016x"),
+    }
+
+
+class TextFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        rendered = super().format(record)
+        trace_fields = _trace_context_fields()
+        if not trace_fields:
+            return rendered
+        suffix = " ".join(f"{key}={value}" for key, value in trace_fields.items())
+        return f"{rendered} {suffix}"
+
+
 class JsonFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         payload: dict[str, Any] = {
@@ -19,6 +50,7 @@ class JsonFormatter(logging.Formatter):
             "logger": record.name,
             "message": record.getMessage(),
         }
+        payload.update(_trace_context_fields())
         for key, value in record.__dict__.items():
             if key.startswith("_") and key not in {"_extra"}:
                 continue
@@ -65,7 +97,7 @@ def configure_logging(config: LoggingConfig) -> None:
     if config.format.lower() == "json":
         handler.setFormatter(JsonFormatter())
     else:
-        handler.setFormatter(logging.Formatter("%(levelname)s:%(name)s:%(message)s"))
+        handler.setFormatter(TextFormatter("%(levelname)s:%(name)s:%(message)s"))
 
     root = logging.getLogger()
     root.handlers.clear()

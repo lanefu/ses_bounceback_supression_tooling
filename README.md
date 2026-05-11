@@ -239,6 +239,14 @@ export OTEL_RESOURCE_ATTRIBUTES=deployment.environment=dev
 
 The app records golden-signal HTTP telemetry through FastAPI instrumentation plus application metrics for SNS message types, signature failures, inserted/duplicate events, bounce type/subtype counts, and AWS suppression outcomes.
 
+When a log line is emitted inside an active trace span, the logger includes trace correlation fields:
+
+```json
+{"level":"INFO","logger":"ses_bounce.web","message":"Bounce event processed","span_id":"1234567890abcdef","timestamp":"2026-05-11T00:03:38.168538+00:00","trace_id":"1234567890abcdef1234567890abcdef"}
+```
+
+Plain-text logs append the same fields as `trace_id=... span_id=...` when trace context is available.
+
 ## Container Image
 
 Build the image:
